@@ -17,7 +17,8 @@ env/
 # Local secrets / runtime state
 .env
 .state/
-.config/
+.config/*
+!.config/providers.json
 
 # Streamlit local config/cache
 .streamlit/secrets.toml

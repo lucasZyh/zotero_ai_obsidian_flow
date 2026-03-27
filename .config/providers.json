@@ -1,0 +1,98 @@
+{
+  "provider_specs": {
+    "openai": {
+      "provider_type": "openai_compatible",
+      "env_var": "OPENAI_API_KEY",
+      "default_model": "gpt-4.1",
+      "models": [
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "gpt-4o"
+      ],
+      "base_url": null
+    },
+    "gemini": {
+      "provider_type": "gemini",
+      "env_var": "GEMINI_API_KEY",
+      "default_model": "gemini-2.5-pro",
+      "models": [
+        "gemini-2.5-pro",
+        "gemini-2.5-flash"
+      ],
+      "base_url": null
+    },
+    "qwen": {
+      "provider_type": "openai_compatible",
+      "env_var": "DASHSCOPE_API_KEY",
+      "default_model": "qwen3.5-plus",
+      "models": [
+        "qwen3.5-plus",
+        "MiniMax/MiniMax-M2.7",
+        "glm-5",
+        "kimi-k2.5",
+        "qwen3.5-flash"
+      ],
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    },
+    "deepseek": {
+      "provider_type": "openai_compatible",
+      "env_var": "DEEPSEEK_API_KEY",
+      "default_model": "deepseek-chat",
+      "models": [
+        "deepseek-chat",
+        "deepseek-reasoner"
+      ],
+      "base_url": "https://api.deepseek.com"
+    },
+    "glm": {
+      "provider_type": "openai_compatible",
+      "env_var": "ZHIPU_API_KEY",
+      "default_model": "glm-4.7",
+      "models": [
+        "glm-4.7",
+        "glm-4-plus",
+        "glm-4-air",
+        "glm-4-flash"
+      ],
+      "base_url": "https://open.bigmodel.cn/api/paas/v4/"
+    },
+    "aihubmix": {
+      "provider_type": "openai_compatible",
+      "env_var": "AIHUBMIX_API_KEY",
+      "default_model": "gpt-4.1",
+      "models": [
+        "gpt-4.1",
+        "gpt-4.1-mini",
+        "claude-sonnet-4-6",
+        "gemini-2.5-pro",
+        "deepseek-chat"
+      ],
+      "base_url": "https://aihubmix.com/v1"
+    },
+    "siliconflow": {
+      "provider_type": "openai_compatible",
+      "env_var": "SILICONFLOW_API_KEY",
+      "default_model": "deepseek-ai/DeepSeek-V3",
+      "models": [
+        "deepseek-ai/DeepSeek-V3",
+        "Qwen/Qwen3-14B",
+        "zai-org/GLM-4.6"
+      ],
+      "base_url": "https://api.siliconflow.cn/v1"
+    }
+  },
+  "providers": {
+    "qwen": {
+      "model": "kimi-k2.5",
+      "provider_type": "openai_compatible",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "custom_models": []
+    },
+    "deepseek": {
+      "model": "deepseek-reasoner",
+      "provider_type": "openai_compatible",
+      "base_url": "https://api.deepseek.com",
+      "custom_models": []
+    }
+  }
+}

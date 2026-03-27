@@ -11,7 +11,7 @@
 ## 已按你的需求调整
 
 1. 默认输出目录：
-`/Users/yuanhao/Library/Mobile Documents/iCloud~md~obsidian/Documents/研究生/论文精度`
+`~/Library/Mobile Documents/iCloud~md~obsidian/Documents/研究生/论文精度`
 
 2. 默认不允许全库扫描，必须明确范围：
 - 扫描某一个 Zotero 目录（collection，仅论文类型）：`--collection`
@@ -26,19 +26,30 @@
 ## 1) 安装
 
 ```bash
-cd /Users/yuanhao/Documents/code/home
+cd <你的项目根目录>
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
 模板文件请放在：
-`/Users/yuanhao/Documents/code/home/templates`
+`./templates`
 
 ## 2) 配置 API Key
 
-API Key 统一保存在项目根目录 `.env`（可在 Web 界面“设置 API Key / 供应商”中维护）。
-脚本会读取 `.env`，不再依赖系统环境变量。
+首次使用（尤其是刚从 GitHub clone）只需要准备 `.env`。  
+`.config/providers.json` 已随仓库提供；如需新增/调整供应商，可在界面“设置 API Key / 供应商”中修改。
+
+示例 `.env`：
+
+```dotenv
+OPENAI_API_KEY="你的Key"
+DASHSCOPE_API_KEY="你的Key"
+# 可选：用于期刊等级检索（EasyScholar）
+SecretKey="你的EasyScholarSecretKey"
+```
+
+说明：`.env`、`.state/`、`.config/ui_paths.json` 默认不上传到 GitHub；`.config/providers.json` 会随仓库提交。
 
 ## 3) 命令行运行示例
 
@@ -87,16 +98,37 @@ python pipeline.py \
 ### 试运行（仅测连通，不执行分析）
 
 ```bash
-python pipeline.py ... --dry-run
+python pipeline.py \
+  --provider openai \
+  --template "./templates/论文深度分析模板.md" \
+  --collection "新文献阅读" \
+  --limit 1 \
+  --dry-run
 ```
 该模式会测试模型 API 是否联通，并打印将处理/将写入路径；不会提取 PDF 文本做分析，也不会写入 Obsidian。
+
+### 常用补充参数
+
+- `--provider-config`：指定供应商配置文件路径（默认 `./.config/providers.json`）
+- `--zotero-db`：自定义 Zotero 数据库路径
+- `--zotero-storage`：自定义 Zotero storage 路径
+- `--obsidian-root`：自定义 Obsidian 输出目录
+- `--enable-thinking`：开启“深度思考”参数（按供应商能力注入）
+- `--max-pdf-chars`：限制单篇提取 PDF 文本长度（默认 `120000`）
+- `--state-file`：已处理状态文件路径（默认 `./.state/processed_items.json`）
 
 ## 4) 可视化界面
 
 ```bash
-cd /Users/yuanhao/Documents/code/home
+cd <你的项目根目录>
 source .venv/bin/activate
 streamlit run app.py
+```
+
+也可使用：
+
+```bash
+python start_app.py
 ```
 
 界面里可以：
