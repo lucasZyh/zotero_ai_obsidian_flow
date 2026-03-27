@@ -1,46 +1,56 @@
 # Zotero -> AI -> Obsidian 自动论文精读流程
 
-这个工具会自动：
+将 Zotero 中的论文（含 PDF）自动转为结构化精读笔记，并写入 Obsidian。
 
-1. 从本地 `Zotero` 读取论文元数据和 PDF。
-2. 把 PDF 文本交给你选择的 AI（ChatGPT / Gemini / 千问）。
-3. 按你提供的模板生成深度分析 Markdown。
-4. 自动选择（或创建）Obsidian 文件夹并写入笔记。
-5. 支持多供应商：OpenAI、Gemini、千问、DeepSeek、GLM、AIHubMix、硅基流动（SiliconFlow）。
+## 项目概览
 
-## 已按你的需求调整
+本项目提供一套端到端流程：
 
-1. 默认输出目录：
+1. 读取 Zotero 数据库与附件 PDF。
+2. 调用 AI 模型生成结构化论文分析。
+3. 基于模板输出 Obsidian Markdown。
+4. 自动决策并写入目标目录。
+5. 按条目去重，支持强制重跑。
+
+默认输出目录：
 `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/研究生/论文精度`
 
-2. 默认不允许全库扫描，必须明确范围：
-- 扫描某一个 Zotero 目录（collection，仅论文类型）：`--collection`
-- 扫描某一个 Zotero 目录（all，目录下所有含 PDF 类型）：`--collection --collection-all-types`
-- 扫描某个 Zotero 目录下的单篇：`--collection + --collection-item-key`
-- 按父条目 key 直接扫描：`--parent-item-key`（可重复）
-- 若确实要全库扫描，需显式加 `--allow-global-scan`
+## 核心能力
 
-3. 提供可视化操作界面（Streamlit）：`app.py`
-4. 模板默认放在项目目录 `templates/`，网页为下拉选择；模板目录路径可在“设置（路径）”里修改。
+- 多供应商支持：OpenAI、Gemini、千问、DeepSeek、GLM、AIHubMix、SiliconFlow。
+- 可视化运行：Streamlit 界面配置供应商、模型、路径、扫描范围、日志查看。
+- 安全扫描策略：默认禁止全库扫描，必须显式指定范围。
+- 目录智能归档：优先复用已有目录，避免目录碎片化。
+- 本地密钥管理：API Key 存于 `.env`，不写入仓库。
 
-## 1) 安装
+## 快速开始
+
+### 1) 环境要求
+
+- 开发与验证环境：macOS
+- Python 3.10+
+- 本机可访问 Zotero 数据库及 storage 目录
+- 已准备 Obsidian Vault（用于写入输出）
+
+说明：项目默认路径与示例基于 macOS（含 iCloud Drive 目录）。
+
+### 2) 安装
 
 ```bash
-cd <你的项目根目录>
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+git clone git@github.com:lucasZyh/zotero_ai_obsidian_flow.git
+cd zotero_ai_obsidian_flow
+pip3 install -r requirements.txt
 ```
 
-模板文件请放在：
-`./templates`
+模板文件默认位于：`./templates`
 
-## 2) 配置 API Key
+### 3) 配置 API Key
 
-首次使用（尤其是刚从 GitHub clone）只需要准备 `.env`。  
-`.config/providers.json` 已随仓库提供；如需新增/调整供应商，可在界面“设置 API Key / 供应商”中修改。
+首次使用仅需创建项目根目录下的 `.env` 文件。
 
-示例 `.env`：
+`.config/providers.json` 已随仓库提供；如需新增或调整供应商，可在界面“设置 API Key / 供应商”中修改。
+
+`.env` 示例：
 
 ```dotenv
 OPENAI_API_KEY="你的Key"
@@ -49,79 +59,10 @@ DASHSCOPE_API_KEY="你的Key"
 SecretKey="你的EasyScholarSecretKey"
 ```
 
-说明：`.env`、`.state/`、`.config/ui_paths.json` 默认不上传到 GitHub；`.config/providers.json` 会随仓库提交。
-
-## 3) 命令行运行示例
-
-### 按某个 Zotero 目录（推荐）
+### 4) 启动界面
 
 ```bash
-python pipeline.py \
-  --provider deepseek \
-  --template "./templates/论文深度分析模板.md" \
-  --collection "新文献阅读" \
-  --limit 2 \
-  --since-days 0
-```
-
-### 按 Zotero 目录下单篇（不手动查 key 的话可用界面选）
-
-```bash
-python pipeline.py \
-  --provider openai \
-  --template "./templates/论文深度分析模板.md" \
-  --collection "新文献阅读" \
-  --collection-item-key ABCD1234 \
-  --limit 1
-```
-
-### 按父条目 key 直接处理
-
-```bash
-python pipeline.py \
-  --provider qwen \
-  --template "./templates/论文深度分析模板.md" \
-  --parent-item-key A6G4QK3V \
-  --limit 1
-```
-
-### 全库扫描（需显式确认）
-
-```bash
-python pipeline.py \
-  --provider openai \
-  --template "./templates/论文深度分析模板.md" \
-  --allow-global-scan \
-  --limit 5
-```
-
-### 试运行（仅测连通，不执行分析）
-
-```bash
-python pipeline.py \
-  --provider openai \
-  --template "./templates/论文深度分析模板.md" \
-  --collection "新文献阅读" \
-  --limit 1 \
-  --dry-run
-```
-该模式会测试模型 API 是否联通，并打印将处理/将写入路径；不会提取 PDF 文本做分析，也不会写入 Obsidian。
-
-### 常用补充参数
-
-- `--provider-config`：指定供应商配置文件路径（默认 `./.config/providers.json`）
-- `--zotero-db`：自定义 Zotero 数据库路径
-- `--zotero-storage`：自定义 Zotero storage 路径
-- `--obsidian-root`：自定义 Obsidian 输出目录
-- `--enable-thinking`：开启“深度思考”参数（按供应商能力注入）
-- `--max-pdf-chars`：限制单篇提取 PDF 文本长度（默认 `120000`）
-- `--state-file`：已处理状态文件路径（默认 `./.state/processed_items.json`）
-
-## 4) 可视化界面
-
-```bash
-cd <你的项目根目录>
-source .venv/bin/activate
+cd zotero_ai_obsidian_flow
 streamlit run app.py
 ```
 
@@ -131,29 +72,68 @@ streamlit run app.py
 python start_app.py
 ```
 
-界面里可以：
-- 选择 AI 提供商/模型
-- 可选开启“深度思考”开关（当前对 qwen / deepseek / openai 生效）
-- 模型按供应商联动下拉；也可手动输入，保存后会自动加入该供应商下拉列表
-- 主界面隐藏 API Key；通过“设置 API Key / 供应商”按钮弹窗统一配置
-- 弹窗分为两个页面：默认“现有供应商配置”，切换后可“新增自定义供应商”
-- 模板始终下拉选择；模板目录路径可在“设置（路径）”里修改
-- 路径相关项收纳在侧边栏最下方的“设置（路径）”里（模板目录、输出目录、Zotero数据库、storage目录）
-- 选择扫描模式（按目录 / 按目录下单篇 / 按父条目Key / 全库）
-- `最近N天更新` 默认是 `0`（显示全部），并会影响“按目录下单篇”的可选论文列表
-- 一键执行并查看日志
+## 使用说明（Web UI）
 
-## 5) 自动目录策略
+在界面中可完成以下配置与操作：
 
-脚本会按以下顺序决定保存目录：
+- 选择 AI 供应商与模型（支持联动下拉和手动输入）。
+- 维护 API Key 与供应商配置（弹窗统一管理）。
+- 选择模板并设置路径（模板目录、输出目录、Zotero DB、storage）。
+- 选择扫描模式：
+  - 按 Zotero 目录（论文类型）
+  - 按 Zotero 目录（全部类型）
+  - 按 Zotero 目录下单篇
+  - 按父条目 Key
+  - 全库扫描（谨慎）
+- 设置最近 N 天、单次处理数量、是否深度思考、是否试运行、是否强制重跑。
+- 一键执行并查看实时日志。
 
-1. 优先复用 Obsidian 中与 Zotero Collection 同名的目录。
-2. 读取 AI 输出的 `建议目录：xxx`。
-3. 再次调用 AI，将“建议目录”与“已有目录列表”做匹配，优先复用语义最接近的已有目录。
-4. 若仍无法匹配，使用 `建议目录` 新建目录。
-5. 最终落到 `论文精读` 目录（不存在会自动创建）。
+## 目录与文件策略
 
-## 6) 去重策略
+### 自动目录策略
 
-- 默认按父条目 key 去重，已处理过的条目会跳过（即使附件 PDF 批注导致时间变化）。
-- 用 `--force` 可强制重跑。
+输出目录决策顺序如下：
+
+1. 优先命中与 Zotero Collection 同名的 Obsidian 目录。
+2. 读取 AI 输出的“建议目录”。
+3. 在已有目录中进行语义匹配，优先复用最接近目录。
+4. 若无可复用目录，则按建议目录新建。
+5. 最终兜底到 `论文精读`。
+
+### 去重策略
+
+- 默认按父条目 Key 去重。
+- 已处理条目后续会自动跳过（即使附件修改时间变化）。
+- 如需重跑，可在界面启用 `Force`。
+
+## 配置文件说明
+
+| 文件 | 用途 | 是否提交到仓库 |
+|---|---|---|
+| `.config/providers.json` | 供应商目录、模型、默认设置 | 是 |
+| `.env` | API Key / SecretKey 等敏感信息 | 否 |
+| `.config/ui_paths.json` | 本机 UI 路径偏好（本地状态） | 否 |
+| `.state/processed_items.json` | 已处理条目状态 | 否 |
+
+## 安全与隐私
+
+- 仓库默认忽略 `.env`、`.state/`、`.config/ui_paths.json`。
+- API Key 不写入 `providers.json`，由 `.env` 管理。
+- 推送前建议检查本地改动，避免将敏感路径或临时文件误提交。
+
+## 常见问题
+
+### 启动时报“未找到可用供应商”
+
+请确认 `.config/providers.json` 存在且 `provider_specs` 非空。
+
+### 读取不到 Zotero 数据
+
+请在界面“路径设置”中确认：
+
+- Zotero 数据库路径（通常为 `~/Zotero/zotero.sqlite`）
+- Zotero storage 路径（通常为 `~/Zotero/storage`）
+
+### 写入 Obsidian 失败
+
+请确认输出目录存在写权限，并检查 iCloud 同步目录是否可访问。
