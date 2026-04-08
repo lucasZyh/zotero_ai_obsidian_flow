@@ -899,8 +899,8 @@ def safe_folder_name(name: str) -> str:
 
 def safe_filename(name: str) -> str:
     cleaned = re.sub(r"[\\/:*?\"<>|]", " ", name).strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned[:120] if cleaned else "未命名论文"
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    return cleaned[:48] if cleaned else "未命名论文"
 
 
 def parse_ai_output(text: str) -> Tuple[str, str]:
@@ -1301,7 +1301,7 @@ def run() -> int:
                 print(f"[INFO] 目录二次决策：命中已有目录 -> {display_rel_path(target_folder, obsidian_root)}")
         folder_rel = str(target_folder.relative_to(obsidian_root))
         filename_base = safe_filename(p.title or p.parent_key)
-        out_file = target_folder / f"{datetime.now().strftime('%Y%m%d')}-{filename_base}.md"
+        out_file = target_folder / f"{datetime.now().strftime('%Y%m%d_%H%M')}_{filename_base}.md"
         out_file_display = display_rel_path(out_file, obsidian_root)
 
         if args.dry_run:
