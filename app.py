@@ -28,9 +28,121 @@ TEMPLATES_DIR = PROJECT_ROOT / "templates"
 UI_SETTINGS_PATH = PROJECT_ROOT / ".config" / "ui_paths.json"
 ENV_PATH = PROJECT_ROOT / ".env"
 STATE_FILE_PATH = PROJECT_ROOT / ".state" / "processed_items.json"
-DEFAULT_OBSIDIAN = "/Users/yuanhao/Library/Mobile Documents/iCloud~md~obsidian/Documents/研究生/论文精度"
+DEFAULT_OBSIDIAN_VAULT = str(Path.home() / "Documents" / "Obsidian")
+DEFAULT_OBSIDIAN_FOLDER = "论文精读"
 DEFAULT_ZOTERO_DB = str(Path.home() / "Zotero" / "zotero.sqlite")
 DEFAULT_ZOTERO_STORAGE = str(Path.home() / "Zotero" / "storage")
+
+
+def _path_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except Exception:
+        return 0.0
+
+
+def find_obsidian_vault_candidates() -> list[Path]:
+    roots = [
+        Path.home() / "Documents" / "Obsidian",
+        Path.home() / "Obsidian",
+        Path.home() / "Library" / "Mobile Documents" / "iCloud~md~obsidian" / "Documents",
+    ]
+    seen: set[str] = set()
+    candidates: list[Path] = []
+    for root in roots:
+        if not root.exists() or not root.is_dir():
+            continue
+        to_check = [root]
+        try:
+            to_check.extend([p for p in root.iterdir() if p.is_dir()])
+        except Exception:
+            pass
+        for candidate in to_check:
+            if not candidate.exists() or not candidate.is_dir():
+                continue
+            if not (candidate / ".obsidian").exists():
+                continue
+            key = str(candidate.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+    candidates.sort(key=lambda p: (-_path_mtime(p / ".obsidian"), -_path_mtime(p), p.name.lower()))
+    return candidates
+
+
+def detect_obsidian_vault_path() -> str:
+    candidates = find_obsidian_vault_candidates()
+    if candidates:
+        return str(candidates[0])
+    return DEFAULT_OBSIDIAN_VAULT
+
+
+def split_obsidian_output_path(raw_path: str) -> tuple[str, str]:
+    raw = (raw_path or "").strip()
+    if not raw:
+        return detect_obsidian_vault_path(), DEFAULT_OBSIDIAN_FOLDER
+    path = Path(raw).expanduser()
+    current = path
+    while True:
+        if (current / ".obsidian").exists():
+            if current == path:
+                return str(current), ""
+            rel = path.relative_to(current)
+            return str(current), rel.as_posix()
+        if current.parent == current:
+            break
+        current = current.parent
+    return str(path), ""
+
+
+def compose_obsidian_output_path(vault_path: str, folder_path: str) -> str:
+    vault = Path(vault_path or detect_obsidian_vault_path()).expanduser()
+    folder = (folder_path or "").strip().strip("/").strip()
+    if not folder:
+        return str(vault)
+    return str(vault / Path(folder))
+
+
+def find_zotero_path_candidates() -> tuple[list[Path], list[Path]]:
+    data_roots = [
+        Path.home() / "Zotero",
+        Path.home() / "Library" / "Application Support" / "Zotero",
+    ]
+    db_candidates: list[Path] = []
+    storage_candidates: list[Path] = []
+    seen_db: set[str] = set()
+    seen_storage: set[str] = set()
+    for root in data_roots:
+        db_path = root / "zotero.sqlite"
+        if db_path.exists():
+            key = str(db_path.resolve())
+            if key not in seen_db:
+                seen_db.add(key)
+                db_candidates.append(db_path)
+        storage_path = root / "storage"
+        if storage_path.exists() and storage_path.is_dir():
+            key = str(storage_path.resolve())
+            if key not in seen_storage:
+                seen_storage.add(key)
+                storage_candidates.append(storage_path)
+    db_candidates.sort(key=lambda p: (-_path_mtime(p), str(p).lower()))
+    storage_candidates.sort(key=lambda p: (-_path_mtime(p), str(p).lower()))
+    return db_candidates, storage_candidates
+
+
+def detect_zotero_paths() -> tuple[str, str]:
+    db_candidates, storage_candidates = find_zotero_path_candidates()
+    db_path = db_candidates[0] if db_candidates else Path(DEFAULT_ZOTERO_DB).expanduser()
+    storage_path = Path("")
+    sibling_storage = db_path.parent / "storage"
+    if sibling_storage.exists() and sibling_storage.is_dir():
+        storage_path = sibling_storage
+    elif storage_candidates:
+        storage_path = storage_candidates[0]
+    else:
+        storage_path = Path(DEFAULT_ZOTERO_STORAGE).expanduser()
+    return str(db_path), str(storage_path)
 
 
 def load_provider_settings(path: str) -> dict:
@@ -97,6 +209,22 @@ def save_env_map(values: dict[str, str], path: Path = ENV_PATH) -> None:
         os.chmod(path, 0o600)
     except Exception:
         pass
+
+
+def get_env_value(key: str) -> str:
+    return load_env_map().get((key or "").strip(), "")
+
+
+def set_env_value(key: str, value: str) -> None:
+    env_key = (key or "").strip()
+    if not env_key:
+        return
+    envs = load_env_map()
+    if value.strip():
+        envs[env_key] = value.strip()
+    else:
+        envs.pop(env_key, None)
+    save_env_map(envs)
 
 
 def provider_env_key(provider_name: str, spec: dict | None = None) -> str:
@@ -217,14 +345,14 @@ def provider_spec_for_ui(provider: str, settings: dict) -> dict:
     }
 
 
-@st.dialog("设置 API Key / 供应商")
+@st.dialog("API设置")
 def provider_settings_dialog(provider_config: str):
     settings = load_provider_settings(provider_config)
     providers = settings.setdefault("providers", {})
     catalog = settings.setdefault("provider_specs", {})
-    page = st.radio("页面", ["现有供应商配置", "新增自定义供应商"], horizontal=True, index=0)
+    page = st.radio("页面", ["内置供应商", "新增供应商", "MinerU 配置"], horizontal=True, index=0, label_visibility="collapsed")
 
-    if page == "现有供应商配置":
+    if page == "内置供应商":
         names = normalize_provider_names(get_provider_names(settings))
         if not names:
             names = list((settings.get("provider_specs") or {}).keys())
@@ -256,7 +384,7 @@ def provider_settings_dialog(provider_config: str):
             save_provider_settings(provider_config, settings)
             st.success("已保存")
             st.rerun()
-    else:
+    elif page == "新增供应商":
         new_name = st.text_input("供应商名称（英文标识）", value="")
         new_env_var = st.text_input("`.env` 中 API Key 变量名（新供应商）", value="")
         new_api_key = st.text_input("API Key（可选，本地保存）", value="", type="password")
@@ -285,6 +413,104 @@ def provider_settings_dialog(provider_config: str):
                 save_provider_settings(provider_config, settings)
                 st.success(f"已添加供应商：{name}")
                 st.rerun()
+    else:
+        mineru_token = st.text_input(
+            "MinerU API Token",
+            value=get_env_value("MINERU_API_TOKEN"),
+            type="password",
+            key="mineru_api_token_input",
+        )
+        st.caption("将保存到本地 `.env`：`MINERU_API_TOKEN`")
+        if st.button("保存 MinerU Token", key="save_mineru_token"):
+            set_env_value("MINERU_API_TOKEN", mineru_token)
+            st.success("MinerU Token 已保存")
+            st.rerun()
+
+
+@st.dialog("路径设置")
+def path_settings_dialog(ui_locked: bool):
+    ui_saved = load_ui_settings()
+    detected_obsidian_vault = detect_obsidian_vault_path()
+    detected_zotero_db, detected_zotero_storage = detect_zotero_paths()
+    saved_obsidian_root = ui_saved.get("obsidian_root_path", "")
+    saved_obsidian_vault = ui_saved.get("obsidian_vault_path", "")
+    saved_obsidian_folder = ui_saved.get("obsidian_folder_path", "")
+    if saved_obsidian_root and not (saved_obsidian_vault or saved_obsidian_folder):
+        saved_obsidian_vault, saved_obsidian_folder = split_obsidian_output_path(saved_obsidian_root)
+    if "provider_config_path" not in st.session_state:
+        st.session_state["provider_config_path"] = ui_saved.get("provider_config_path", default_provider_config_path())
+    if "template_dir_path" not in st.session_state:
+        st.session_state["template_dir_path"] = ui_saved.get("template_dir_path", str(TEMPLATES_DIR))
+    if "obsidian_vault_path" not in st.session_state:
+        st.session_state["obsidian_vault_path"] = saved_obsidian_vault or detected_obsidian_vault
+    if "obsidian_folder_path" not in st.session_state:
+        st.session_state["obsidian_folder_path"] = saved_obsidian_folder or DEFAULT_OBSIDIAN_FOLDER
+    if "zotero_db_path" not in st.session_state:
+        st.session_state["zotero_db_path"] = ui_saved.get("zotero_db_path", detected_zotero_db)
+    if "zotero_storage_path" not in st.session_state:
+        st.session_state["zotero_storage_path"] = ui_saved.get("zotero_storage_path", detected_zotero_storage)
+
+    provider_config = st.text_input(
+        "供应商配置文件",
+        value=st.session_state.get("provider_config_path", default_provider_config_path()),
+        key="provider_config_path",
+        disabled=ui_locked,
+    )
+
+    st.text_input(
+        "模板目录",
+        value=st.session_state.get("template_dir_path", str(TEMPLATES_DIR)),
+        key="template_dir_path",
+        disabled=ui_locked,
+    )
+
+    st.text_input(
+        "Obsidian库路径",
+        value=st.session_state.get("obsidian_vault_path", detected_obsidian_vault),
+        key="obsidian_vault_path",
+        disabled=ui_locked,
+    )
+
+    obsidian_folder = st.text_input(
+        "Obsidian库内文件夹",
+        value=st.session_state.get("obsidian_folder_path", DEFAULT_OBSIDIAN_FOLDER),
+        key="obsidian_folder_path",
+        disabled=ui_locked,
+        help="相对于 Obsidian 库根目录的输出位置，例如：论文精读 或 Research/Papers",
+    )
+
+    st.text_input(
+        "Zotero数据库",
+        value=st.session_state.get("zotero_db_path", detected_zotero_db),
+        key="zotero_db_path",
+        disabled=ui_locked,
+    )
+
+    st.text_input(
+        "Zotero storage目录",
+        value=st.session_state.get("zotero_storage_path", detected_zotero_storage),
+        key="zotero_storage_path",
+        disabled=ui_locked,
+    )
+
+    if st.button("保存路径设置", key="save_path_settings_btn", disabled=ui_locked):
+        obsidian_output_path = compose_obsidian_output_path(
+            st.session_state.get("obsidian_vault_path", detected_obsidian_vault),
+            st.session_state.get("obsidian_folder_path", DEFAULT_OBSIDIAN_FOLDER),
+        )
+        save_ui_settings(
+            {
+                "provider_config_path": st.session_state.get("provider_config_path", default_provider_config_path()),
+                "template_dir_path": st.session_state.get("template_dir_path", str(TEMPLATES_DIR)),
+                "obsidian_vault_path": st.session_state.get("obsidian_vault_path", detected_obsidian_vault),
+                "obsidian_folder_path": st.session_state.get("obsidian_folder_path", DEFAULT_OBSIDIAN_FOLDER),
+                "obsidian_root_path": obsidian_output_path,
+                "zotero_db_path": st.session_state.get("zotero_db_path", detected_zotero_db),
+                "zotero_storage_path": st.session_state.get("zotero_storage_path", detected_zotero_storage),
+            }
+        )
+        st.success("路径设置已保存")
+        st.rerun()
 
 
 @st.cache_data(ttl=60)
@@ -322,43 +548,6 @@ def list_template_files(template_dir: str) -> list[Path]:
     d.mkdir(parents=True, exist_ok=True)
     files = sorted(d.glob("*.md"), key=lambda p: p.name.lower())
     return files
-
-
-def _apple_escape(s: str) -> str:
-    return (s or "").replace("\\", "\\\\").replace("\"", "\\\"")
-
-
-def pick_directory_dialog(initial_dir: str) -> str:
-    # 使用 osascript 弹出系统对话框，避免 tkinter 在非主线程崩溃
-    initial = _apple_escape(initial_dir or str(Path.home()))
-    script = (
-        f'set p to POSIX file "{initial}"\n'
-        "set chosenFolder to choose folder default location p\n"
-        "POSIX path of chosenFolder"
-    )
-    try:
-        p = subprocess.run(["osascript", "-e", script], text=True, capture_output=True)
-        if p.returncode != 0:
-            return ""
-        return (p.stdout or "").strip()
-    except Exception:
-        return ""
-
-
-def pick_file_dialog(initial_dir: str, filetypes: list[tuple[str, str]]) -> str:
-    initial = _apple_escape(initial_dir or str(Path.home()))
-    script = (
-        f'set p to POSIX file "{initial}"\n'
-        "set chosenFile to choose file default location p\n"
-        "POSIX path of chosenFile"
-    )
-    try:
-        p = subprocess.run(["osascript", "-e", script], text=True, capture_output=True)
-        if p.returncode != 0:
-            return ""
-        return (p.stdout or "").strip()
-    except Exception:
-        return ""
 
 
 def render_overview_cards(
@@ -508,31 +697,27 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # 处理上一轮“选择路径”按钮写入的待更新值，避免修改已实例化 widget 的同 key
-    pending_map = {
-        "pending_provider_config_path": "provider_config_path",
-        "pending_template_dir_path": "template_dir_path",
-        "pending_obsidian_root_path": "obsidian_root_path",
-        "pending_zotero_db_path": "zotero_db_path",
-        "pending_zotero_storage_path": "zotero_storage_path",
-    }
-    for pending_key, target_key in pending_map.items():
-        if pending_key in st.session_state and st.session_state[pending_key]:
-            st.session_state[target_key] = st.session_state[pending_key]
-            del st.session_state[pending_key]
-
     # 初始化可持久化 UI 路径设置
     ui_saved = load_ui_settings()
+    detected_obsidian_vault = detect_obsidian_vault_path()
+    detected_zotero_db, detected_zotero_storage = detect_zotero_paths()
+    saved_obsidian_root = ui_saved.get("obsidian_root_path", "")
+    saved_obsidian_vault = ui_saved.get("obsidian_vault_path", "")
+    saved_obsidian_folder = ui_saved.get("obsidian_folder_path", "")
+    if saved_obsidian_root and not (saved_obsidian_vault or saved_obsidian_folder):
+        saved_obsidian_vault, saved_obsidian_folder = split_obsidian_output_path(saved_obsidian_root)
     if "provider_config_path" not in st.session_state:
         st.session_state["provider_config_path"] = ui_saved.get("provider_config_path", default_provider_config_path())
     if "template_dir_path" not in st.session_state:
         st.session_state["template_dir_path"] = ui_saved.get("template_dir_path", str(TEMPLATES_DIR))
-    if "obsidian_root_path" not in st.session_state:
-        st.session_state["obsidian_root_path"] = ui_saved.get("obsidian_root_path", DEFAULT_OBSIDIAN)
+    if "obsidian_vault_path" not in st.session_state:
+        st.session_state["obsidian_vault_path"] = saved_obsidian_vault or detected_obsidian_vault
+    if "obsidian_folder_path" not in st.session_state:
+        st.session_state["obsidian_folder_path"] = saved_obsidian_folder or DEFAULT_OBSIDIAN_FOLDER
     if "zotero_db_path" not in st.session_state:
-        st.session_state["zotero_db_path"] = ui_saved.get("zotero_db_path", DEFAULT_ZOTERO_DB)
+        st.session_state["zotero_db_path"] = ui_saved.get("zotero_db_path", detected_zotero_db)
     if "zotero_storage_path" not in st.session_state:
-        st.session_state["zotero_storage_path"] = ui_saved.get("zotero_storage_path", DEFAULT_ZOTERO_STORAGE)
+        st.session_state["zotero_storage_path"] = ui_saved.get("zotero_storage_path", detected_zotero_storage)
     if "run_proc" not in st.session_state:
         st.session_state["run_proc"] = None
     if "run_log_path" not in st.session_state:
@@ -555,7 +740,10 @@ def main():
         st.header("基础配置")
         provider_config = st.session_state["provider_config_path"]
         template_dir = st.session_state["template_dir_path"]
-        obsidian_root = st.session_state["obsidian_root_path"]
+        obsidian_root = compose_obsidian_output_path(
+            st.session_state.get("obsidian_vault_path", detected_obsidian_vault),
+            st.session_state.get("obsidian_folder_path", DEFAULT_OBSIDIAN_FOLDER),
+        )
         zotero_db = st.session_state["zotero_db_path"]
         zotero_storage = st.session_state["zotero_storage_path"]
 
@@ -563,7 +751,7 @@ def main():
         provider_names = normalize_provider_names(get_provider_names(settings))
         provider_names = [x for x in provider_names if isinstance(x, str) and x.strip()]
         if not provider_names:
-            st.error("未找到可用供应商，请先在“设置 API Key / 供应商”中添加。")
+            st.error("未找到可用供应商，请先在“API设置”中添加。")
             st.stop()
         provider_state_key = "provider_selected_value_v5"
         if st.session_state.get(provider_state_key) not in provider_names:
@@ -587,8 +775,13 @@ def main():
             model = st.text_input("输入模型名", value=default_model, key="model_custom_value_v5", disabled=ui_locked)
         else:
             model = selected_model
-        if st.button("设置 API Key / 供应商", disabled=ui_locked):
-            provider_settings_dialog(provider_config)
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("API设置", disabled=ui_locked, use_container_width=True):
+                provider_settings_dialog(provider_config)
+        with b2:
+            if st.button("路径设置", disabled=ui_locked, use_container_width=True):
+                path_settings_dialog(ui_locked)
 
         templates = list_template_files(template_dir)
         if not templates:
@@ -603,63 +796,42 @@ def main():
         enable_thinking = st.checkbox("深度思考（不建议开启）", value=False, disabled=ui_locked)
         dry_run = st.checkbox("试运行（测试连通，不分析）", value=False, disabled=ui_locked)
         force = st.checkbox("Force（忽略已处理记录）", value=False, disabled=ui_locked)
-
-        with st.expander("路径设置", expanded=False):
-            provider_config = st.text_input("供应商配置文件", key="provider_config_path", disabled=ui_locked)
-
-            c1, c2 = st.columns([20, 1], gap="small")
-            with c1:
-                template_dir = st.text_input("模板目录", key="template_dir_path", disabled=ui_locked)
-            with c2:
-                st.write("")
-                if st.button(" ", key="pick_template_dir_btn", help="选择模板目录", disabled=ui_locked):
-                    chosen = pick_directory_dialog(template_dir)
-                    if chosen:
-                        st.session_state["pending_template_dir_path"] = chosen
-                        st.rerun()
-
-            c1, c2 = st.columns([20, 1], gap="small")
-            with c1:
-                obsidian_root = st.text_input("Obsidian输出目录", key="obsidian_root_path", disabled=ui_locked)
-            with c2:
-                st.write("")
-                if st.button(" ", key="pick_obsidian_root_btn", help="选择 Obsidian 输出目录", disabled=ui_locked):
-                    chosen = pick_directory_dialog(obsidian_root)
-                    if chosen:
-                        st.session_state["pending_obsidian_root_path"] = chosen
-                        st.rerun()
-
-            c1, c2 = st.columns([20, 1], gap="small")
-            with c1:
-                zotero_db = st.text_input("Zotero数据库", key="zotero_db_path", disabled=ui_locked)
-            with c2:
-                st.write("")
-                if st.button(" ", key="pick_zotero_db_btn", help="选择 Zotero 数据库文件", disabled=ui_locked):
-                    initial_dir = str(Path(zotero_db).expanduser().parent) if zotero_db else str(Path.home())
-                    chosen = pick_file_dialog(initial_dir, [("SQLite DB", "*.sqlite"), ("All files", "*.*")])
-                    if chosen:
-                        st.session_state["pending_zotero_db_path"] = chosen
-                        st.rerun()
-
-            c1, c2 = st.columns([20, 1], gap="small")
-            with c1:
-                zotero_storage = st.text_input("Zotero storage目录", key="zotero_storage_path", disabled=ui_locked)
-            with c2:
-                st.write("")
-                if st.button(" ", key="pick_zotero_storage_btn", help="选择 Zotero storage 目录", disabled=ui_locked):
-                    chosen = pick_directory_dialog(zotero_storage)
-                    if chosen:
-                        st.session_state["pending_zotero_storage_path"] = chosen
-                        st.rerun()
+        pdf_parser_label = st.selectbox(
+            "PDF 解析方式",
+            ["自动（MinerU 优先）", "MinerU", "本地 pypdf"],
+            index=0,
+            key="pdf_parser_mode_v1",
+            disabled=ui_locked,
+        )
+        parser_mode_map = {
+            "自动（MinerU 优先）": "auto",
+            "MinerU": "mineru",
+            "本地 pypdf": "pypdf",
+        }
+        pdf_parser = parser_mode_map[pdf_parser_label]
+        mineru_model_version = st.text_input(
+            "MinerU 模型版本",
+            value="vlm",
+            key="mineru_model_version_v1",
+            disabled=ui_locked,
+        )
+        mineru_language = st.text_input(
+            "文档语言",
+            value="en",
+            key="mineru_language_v1",
+            disabled=ui_locked,
+        )
 
         # 将路径设置持久化，保证下次打开沿用
         save_ui_settings(
             {
                 "provider_config_path": st.session_state.get("provider_config_path", default_provider_config_path()),
                 "template_dir_path": st.session_state.get("template_dir_path", str(TEMPLATES_DIR)),
-                "obsidian_root_path": st.session_state.get("obsidian_root_path", DEFAULT_OBSIDIAN),
-                "zotero_db_path": st.session_state.get("zotero_db_path", DEFAULT_ZOTERO_DB),
-                "zotero_storage_path": st.session_state.get("zotero_storage_path", DEFAULT_ZOTERO_STORAGE),
+                "obsidian_vault_path": st.session_state.get("obsidian_vault_path", detected_obsidian_vault),
+                "obsidian_folder_path": st.session_state.get("obsidian_folder_path", DEFAULT_OBSIDIAN_FOLDER),
+                "obsidian_root_path": obsidian_root,
+                "zotero_db_path": st.session_state.get("zotero_db_path", detected_zotero_db),
+                "zotero_storage_path": st.session_state.get("zotero_storage_path", detected_zotero_storage),
             }
         )
 
@@ -792,6 +964,12 @@ def main():
             str(int(limit)),
             "--since-days",
             str(int(since_days)),
+            "--pdf-parser",
+            pdf_parser,
+            "--mineru-model-version",
+            mineru_model_version.strip() or "vlm",
+            "--mineru-language",
+            mineru_language.strip() or "en",
         ]
 
         if model.strip():

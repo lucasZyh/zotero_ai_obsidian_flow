@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import base64
+import hashlib
+import http.client
+import io
 import json
+import mimetypes
 import re
 import shutil
 import sqlite3
@@ -11,9 +16,11 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+from zipfile import ZipFile
+from zoneinfo import ZoneInfo
 
 @dataclass
 class Paper:
@@ -40,6 +47,15 @@ class Paper:
             self.collections = []
 
 
+@dataclass
+class ParsedDocument:
+    content: str
+    content_format: str
+    parser_name: str
+    truncated: bool
+    meta: Dict[str, Any]
+
+
 PAPER_ITEM_TYPES = {
     "journalArticle",   # 期刊论文
     "conferencePaper",  # 会议论文
@@ -51,6 +67,11 @@ ENV_PATH = Path(__file__).resolve().parent / ".env"
 EASYSCHOLAR_API_URL = "https://www.easyscholar.cc/open/getPublicationRank"
 EASYSCHOLAR_KEYS = ("sciif", "sci", "sciUp")
 _EASYSCHOLAR_LAST_CALL_TS = 0.0
+MINERU_API_BASE = "https://mineru.net/api/v4"
+MINERU_POLL_INTERVAL_SEC = 5.0
+MINERU_POLL_TIMEOUT_SEC = 600.0
+MAX_MULTIMODAL_IMAGES = 6
+LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def default_provider_config_path() -> str:
@@ -64,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--template", required=True, help="论文分析模板 markdown 路径")
     parser.add_argument(
         "--obsidian-root",
-        default=str(Path.home() / "Library/Mobile Documents/iCloud~md~obsidian/Documents/研究生/论文精度"),
+        default=str(Path.home() / "Documents" / "Obsidian" / "论文精读"),
         help="Obsidian 根目录",
     )
     parser.add_argument("--provider", required=True)
@@ -104,6 +125,22 @@ def parse_args() -> argparse.Namespace:
         "--allow-global-scan",
         action="store_true",
         help="允许全局扫描（不建议，默认关闭）",
+    )
+    parser.add_argument(
+        "--pdf-parser",
+        choices=["auto", "mineru", "pypdf"],
+        default="auto",
+        help="PDF 解析方式：默认优先 MinerU，失败回退到本地 pypdf",
+    )
+    parser.add_argument(
+        "--mineru-model-version",
+        default="vlm",
+        help="MinerU 标准 API 的 model_version",
+    )
+    parser.add_argument(
+        "--mineru-language",
+        default="en",
+        help="MinerU 标准 API 的 language 参数",
     )
     parser.add_argument("--max-pdf-chars", type=int, default=120000)
     parser.add_argument("--enable-thinking", action="store_true", help="开启深度思考（按供应商能力注入对应参数）")
@@ -263,7 +300,6 @@ def get_api_key(
             f"缺少 API Key，请设置参数 --api-key 或在 {ENV_PATH} 中配置 {env_var}"
         )
     return key
-
 
 def load_template(path: str) -> str:
     return Path(path).read_text(encoding="utf-8")
@@ -731,7 +767,15 @@ def resolve_pdf_path(zotero_storage: str, paper: Paper) -> Optional[Path]:
     return None
 
 
-def extract_pdf_text(pdf_path: Path, max_chars: int) -> str:
+def truncate_content(content: str, max_chars: int) -> Tuple[str, bool]:
+    if max_chars <= 0:
+        return content, False
+    if len(content) <= max_chars:
+        return content, False
+    return content[:max_chars], True
+
+
+def extract_pypdf_document(pdf_path: Path, max_chars: int) -> ParsedDocument:
     from pypdf import PdfReader
 
     reader = PdfReader(str(pdf_path))
@@ -747,7 +791,492 @@ def extract_pdf_text(pdf_path: Path, max_chars: int) -> str:
         text = text[:remain]
         chunks.append(text)
         total += len(text)
-    return "\n\n".join(chunks)
+    return ParsedDocument(
+        content="\n\n".join(chunks),
+        content_format="plain_text",
+        parser_name="pypdf",
+        truncated=total >= max_chars > 0,
+        meta={"cache_hit": False},
+    )
+
+
+def parser_cache_key(paper: Paper, parser_name: str, model_version: str) -> str:
+    raw = f"{paper.attachment_key}|{paper.date_modified}|{parser_name}|{model_version}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def parser_cache_dir(cache_root: Path, paper: Paper, parser_name: str, model_version: str) -> Path:
+    return cache_root / parser_cache_key(paper, parser_name, model_version)
+
+
+def load_cached_parsed_document(
+    cache_root: Path,
+    paper: Paper,
+    parser_name: str,
+    model_version: str,
+    max_chars: int,
+) -> Optional[ParsedDocument]:
+    cache_dir = parser_cache_dir(cache_root, paper, parser_name, model_version)
+    meta_path = cache_dir / "meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    bundle_md_raw = ""
+    if isinstance(meta, dict):
+        bundle_md_raw = str(meta.get("bundle_markdown_path") or "").strip()
+    md_path = Path(bundle_md_raw) if bundle_md_raw else (cache_dir / "full.md")
+    if not md_path.exists():
+        return None
+    try:
+        content = md_path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    clipped, truncated = truncate_content(content, max_chars)
+    merged_meta = dict(meta if isinstance(meta, dict) else {})
+    merged_meta["cache_hit"] = True
+    merged_meta["cache_key"] = cache_dir.name
+    bundle_dir = cache_dir / "bundle"
+    if bundle_dir.exists():
+        merged_meta["bundle_dir"] = str(bundle_dir)
+    return ParsedDocument(
+        content=clipped,
+        content_format="markdown",
+        parser_name=parser_name,
+        truncated=truncated,
+        meta=merged_meta,
+    )
+
+
+def save_cached_parsed_document(
+    cache_root: Path,
+    paper: Paper,
+    parser_name: str,
+    model_version: str,
+    content: str,
+    meta: Dict[str, Any],
+) -> None:
+    cache_dir = parser_cache_dir(cache_root, paper, parser_name, model_version)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_meta = dict(meta)
+    cache_meta["parser_name"] = parser_name
+    cache_meta["content_format"] = "markdown"
+    cache_meta["cached_at"] = datetime.now().isoformat(timespec="seconds")
+    cache_meta["cache_key"] = cache_dir.name
+    bundle_markdown_path = str(cache_meta.get("bundle_markdown_path") or "").strip()
+    if not bundle_markdown_path:
+        (cache_dir / "full.md").write_text(content, encoding="utf-8")
+    else:
+        (cache_dir / "full.md").unlink(missing_ok=True)
+    (cache_dir / "meta.json").write_text(
+        json.dumps(cache_meta, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def parser_bundle_dir(cache_root: Path, paper: Paper, parser_name: str, model_version: str) -> Path:
+    return parser_cache_dir(cache_root, paper, parser_name, model_version) / "bundle"
+
+
+def mineru_api_json(
+    method: str,
+    path_or_url: str,
+    token: str,
+    payload: Optional[Dict[str, Any]] = None,
+    timeout: int = 60,
+) -> Dict[str, Any]:
+    url = path_or_url if path_or_url.startswith("http") else f"{MINERU_API_BASE}{path_or_url}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+    data = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method=method.upper())
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8", errors="ignore")
+    obj = json.loads(body)
+    if not isinstance(obj, dict):
+        raise RuntimeError("MinerU 返回了非对象响应")
+    code = obj.get("code")
+    if code not in (0, 200):
+        msg = obj.get("msg") or obj.get("message") or "未知错误"
+        raise RuntimeError(f"MinerU API 调用失败: code={code}, msg={msg}")
+    return obj
+
+
+def http_request_bytes(
+    method: str,
+    url: str,
+    body: Optional[bytes] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 120,
+) -> Tuple[int, str, bytes]:
+    parts = urllib.parse.urlsplit(url)
+    path = parts.path or "/"
+    if parts.query:
+        path = f"{path}?{parts.query}"
+    conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(parts.netloc, timeout=timeout)
+    req_headers = dict(headers or {})
+    if body is not None and "Content-Length" not in req_headers:
+        req_headers["Content-Length"] = str(len(body))
+    if "User-Agent" not in req_headers:
+        req_headers["User-Agent"] = "zotero-ai-obsidian-flow/1.0"
+    try:
+        conn.putrequest(method.upper(), path)
+        for key, value in req_headers.items():
+            conn.putheader(key, value)
+        conn.endheaders()
+        if body is not None:
+            conn.send(body)
+        resp = conn.getresponse()
+        payload = resp.read()
+        return int(resp.status), str(resp.reason), payload
+    finally:
+        conn.close()
+
+
+def mineru_upload_file(upload_url: str, pdf_path: Path, timeout: int = 300) -> None:
+    data = pdf_path.read_bytes()
+    status, reason, payload = http_request_bytes("PUT", upload_url, body=data, timeout=timeout)
+    if status >= 400:
+        detail = payload.decode("utf-8", errors="ignore")[:300].strip()
+        raise RuntimeError(f"MinerU 上传失败: HTTP {status} {reason}; {detail}")
+
+
+def mineru_download_full_markdown(full_zip_url: str) -> str:
+    last_error = ""
+    for _ in range(3):
+        try:
+            payload = mineru_download_zip_payload(full_zip_url)
+            return payload_to_markdown(payload)
+        except Exception as exc:
+            last_error = str(exc)
+            time.sleep(1.0)
+    raise RuntimeError(f"MinerU 下载 full.zip 失败: {last_error}")
+
+
+def mineru_download_zip_payload(full_zip_url: str) -> bytes:
+    status, reason, payload = http_request_bytes(
+        "GET",
+        full_zip_url,
+        headers={"Accept": "application/zip"},
+        timeout=120,
+    )
+    if status >= 400:
+        detail = payload.decode("utf-8", errors="ignore")[:300].strip()
+        raise RuntimeError(f"HTTP {status} {reason}; {detail}")
+    return payload
+
+
+def payload_to_markdown(zip_payload: bytes) -> str:
+    with ZipFile(io.BytesIO(zip_payload)) as zf:
+        names = zf.namelist()
+        target = next((n for n in names if n.endswith("/full.md")), None)
+        if target is None and "full.md" in names:
+            target = "full.md"
+        if target is None:
+            raise RuntimeError("MinerU full.zip 中未找到 full.md")
+        return zf.read(target).decode("utf-8", errors="ignore")
+
+
+def extract_bundle_payload(zip_payload: bytes, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with ZipFile(io.BytesIO(zip_payload)) as zf:
+        zf.extractall(output_dir)
+        names = zf.namelist()
+    target = next((n for n in names if n.endswith("/full.md")), None)
+    if target is None and "full.md" in names:
+        target = "full.md"
+    if target is None:
+        raise RuntimeError("MinerU full.zip 中未找到 full.md")
+    return output_dir / target
+
+
+def mineru_extract_bundle(full_zip_url: str, output_dir: Path) -> Path:
+    last_error = ""
+    for _ in range(3):
+        try:
+            payload = mineru_download_zip_payload(full_zip_url)
+            return extract_bundle_payload(payload, output_dir)
+        except Exception as exc:
+            last_error = str(exc)
+            time.sleep(1.0)
+    raise RuntimeError(f"MinerU 解压 full.zip 失败: {last_error}")
+
+
+def mineru_extract_result_entry(result_obj: Dict[str, Any], data_id: str) -> Dict[str, Any]:
+    data = result_obj.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("MinerU 返回缺少 data 字段")
+    extract_result = data.get("extract_result")
+    if not isinstance(extract_result, list):
+        raise RuntimeError("MinerU 返回缺少 extract_result 列表")
+    for item in extract_result:
+        if isinstance(item, dict) and str(item.get("data_id") or "") == data_id:
+            return item
+    raise RuntimeError("MinerU 结果中未找到目标文件")
+
+
+def mineru_wait_for_result(token: str, batch_id: str, data_id: str) -> Dict[str, Any]:
+    deadline = time.monotonic() + MINERU_POLL_TIMEOUT_SEC
+    last_state = ""
+    while time.monotonic() < deadline:
+        obj = mineru_api_json("GET", f"/extract-results/batch/{batch_id}", token, timeout=60)
+        item = mineru_extract_result_entry(obj, data_id)
+        state = str(item.get("state") or "").strip().lower()
+        if state:
+            last_state = state
+        if state in {"done", "success", "completed"}:
+            return item
+        if state in {"failed", "error"}:
+            msg = item.get("err_msg") or item.get("message") or "未知错误"
+            raise RuntimeError(f"MinerU 解析失败: {msg}")
+        time.sleep(MINERU_POLL_INTERVAL_SEC)
+    raise RuntimeError(f"MinerU 解析超时，最后状态: {last_state or 'unknown'}")
+
+
+def extract_mineru_document(
+    pdf_path: Path,
+    paper: Paper,
+    max_chars: int,
+    cache_root: Path,
+    token: str,
+    model_version: str,
+    language: str,
+) -> ParsedDocument:
+    cached = load_cached_parsed_document(cache_root, paper, "mineru", model_version, max_chars)
+    if cached is not None:
+        return cached
+
+    data_id = f"{paper.attachment_key}-{int(time.time())}"
+    payload = {
+        "model_version": model_version,
+        "language": language,
+        "enable_formula": True,
+        "enable_table": True,
+        "files": [
+            {
+                "name": pdf_path.name,
+                "is_ocr": False,
+                "data_id": data_id,
+            }
+        ]
+    }
+    created = mineru_api_json("POST", "/file-urls/batch", token, payload=payload, timeout=60)
+    data = created.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("MinerU 创建任务失败：缺少 data")
+    batch_id = str(data.get("batch_id") or "").strip()
+    file_urls = data.get("file_urls")
+    if not batch_id or not isinstance(file_urls, list) or not file_urls:
+        raise RuntimeError("MinerU 创建任务失败：缺少 batch_id 或 file_urls")
+    upload_url = str(file_urls[0] or "").strip()
+    if not upload_url:
+        raise RuntimeError("MinerU 创建任务失败：缺少上传地址")
+
+    mineru_upload_file(upload_url, pdf_path)
+    item = mineru_wait_for_result(token, batch_id, data_id)
+    full_zip_url = str(item.get("full_zip_url") or "").strip()
+    if not full_zip_url:
+        raise RuntimeError("MinerU 返回缺少 full_zip_url")
+    upload_host = urllib.parse.urlsplit(upload_url).netloc
+    download_host = urllib.parse.urlsplit(full_zip_url).netloc
+    try:
+        zip_payload = mineru_download_zip_payload(full_zip_url)
+        full_md = payload_to_markdown(zip_payload)
+        bundle_dir = parser_bundle_dir(cache_root, paper, "mineru", model_version)
+        bundle_markdown_path = extract_bundle_payload(zip_payload, bundle_dir)
+    except Exception as exc:
+        raise RuntimeError(
+            f"MinerU 下载解析结果失败: batch={batch_id}, data={data_id}, "
+            f"upload_host={upload_host}, download_host={download_host}, error={exc}"
+        ) from exc
+    save_cached_parsed_document(
+        cache_root=cache_root,
+        paper=paper,
+        parser_name="mineru",
+        model_version=model_version,
+        content=full_md,
+        meta={
+            "batch_id": batch_id,
+            "data_id": data_id,
+            "full_zip_url": full_zip_url,
+            "upload_host": upload_host,
+            "download_host": download_host,
+            "bundle_dir": str(bundle_dir),
+            "bundle_markdown_path": str(bundle_markdown_path),
+            "cache_hit": False,
+        },
+    )
+    clipped, truncated = truncate_content(full_md, max_chars)
+    return ParsedDocument(
+        content=clipped,
+        content_format="markdown",
+        parser_name="mineru",
+        truncated=truncated,
+        meta={
+            "batch_id": batch_id,
+            "data_id": data_id,
+            "full_zip_url": full_zip_url,
+            "upload_host": upload_host,
+            "download_host": download_host,
+            "bundle_dir": str(bundle_dir),
+            "bundle_markdown_path": str(bundle_markdown_path),
+            "cache_hit": False,
+        },
+    )
+
+
+def extract_document_content(
+    pdf_path: Path,
+    paper: Paper,
+    pdf_parser: str,
+    max_chars: int,
+    cache_root: Path,
+    mineru_token: str,
+    mineru_model_version: str,
+    mineru_language: str,
+) -> ParsedDocument:
+    if pdf_parser == "pypdf":
+        return extract_pypdf_document(pdf_path, max_chars)
+
+    if pdf_parser == "mineru":
+        if not mineru_token:
+            raise RuntimeError(f"缺少 MinerU API Token，请在 {ENV_PATH} 中配置 MINERU_API_TOKEN")
+        return extract_mineru_document(
+            pdf_path=pdf_path,
+            paper=paper,
+            max_chars=max_chars,
+            cache_root=cache_root,
+            token=mineru_token,
+            model_version=mineru_model_version,
+            language=mineru_language,
+        )
+
+    if mineru_token:
+        try:
+            doc = extract_mineru_document(
+                pdf_path=pdf_path,
+                paper=paper,
+                max_chars=max_chars,
+                cache_root=cache_root,
+                token=mineru_token,
+                model_version=mineru_model_version,
+                language=mineru_language,
+            )
+            doc.meta.setdefault("fallback_reason", "")
+            return doc
+        except Exception as exc:
+            fallback = extract_pypdf_document(pdf_path, max_chars)
+            fallback.meta["fallback_reason"] = str(exc)
+            fallback.meta["cache_hit"] = False
+            return fallback
+
+    fallback = extract_pypdf_document(pdf_path, max_chars)
+    fallback.meta["fallback_reason"] = "MINERU_API_TOKEN 未配置"
+    return fallback
+
+
+def image_refs_from_markdown(markdown: str) -> List[Tuple[str, int]]:
+    refs: List[Tuple[str, int]] = []
+    for idx, line in enumerate(markdown.splitlines()):
+        for match in re.finditer(r"!\[[^\]]*\]\(([^)]+)\)", line):
+            refs.append((match.group(1).strip(), idx))
+    return refs
+
+
+def score_markdown_image(markdown_lines: List[str], line_idx: int) -> int:
+    start = max(0, line_idx - 3)
+    end = min(len(markdown_lines), line_idx + 4)
+    score = 0
+    for offset, line in enumerate(markdown_lines[start:end], start=start):
+        text = line.lower()
+        if "fig." in text or "figure" in text:
+            distance = abs(offset - line_idx)
+            score = max(score, 100 - distance * 10)
+    return score
+
+
+def select_multimodal_images(parsed_doc: ParsedDocument, max_images: int = MAX_MULTIMODAL_IMAGES) -> List[Path]:
+    if parsed_doc.parser_name != "mineru" or parsed_doc.content_format != "markdown":
+        return []
+    bundle_dir_raw = str(parsed_doc.meta.get("bundle_dir") or "").strip()
+    bundle_md_raw = str(parsed_doc.meta.get("bundle_markdown_path") or "").strip()
+    if not bundle_dir_raw or not bundle_md_raw:
+        return []
+
+    bundle_dir = Path(bundle_dir_raw)
+    bundle_md_path = Path(bundle_md_raw)
+    if not bundle_dir.exists() or not bundle_md_path.exists():
+        return []
+
+    markdown_lines = parsed_doc.content.splitlines()
+    ranked: List[Tuple[int, int, Path]] = []
+    seen: set[str] = set()
+    for ref, line_idx in image_refs_from_markdown(parsed_doc.content):
+        clean_ref = ref.strip().strip("<>").strip()
+        if not clean_ref or "://" in clean_ref:
+            continue
+        image_path = (bundle_md_path.parent / clean_ref).resolve()
+        if not image_path.exists() or not image_path.is_file():
+            continue
+        key = str(image_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        score = score_markdown_image(markdown_lines, line_idx)
+        ranked.append((score, line_idx, image_path))
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return [path for _, _, path in ranked[:max_images]]
+
+
+def image_path_to_data_url(image_path: Path) -> str:
+    mime_type, _ = mimetypes.guess_type(str(image_path))
+    mime_type = mime_type or "application/octet-stream"
+    payload = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{payload}"
+
+
+def build_openai_user_content(user_prompt: str, image_paths: List[Path]) -> List[Dict[str, object]]:
+    content: List[Dict[str, object]] = [{"type": "text", "text": user_prompt}]
+    if image_paths:
+        content.append(
+            {
+                "type": "text",
+                "text": f"下面附上从论文中筛选出的 {len(image_paths)} 张关键配图，请结合图像内容理解图表、显微图和流程图。",
+            }
+        )
+        for image_path in image_paths:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_path_to_data_url(image_path)},
+                }
+            )
+    return content
+
+
+def should_fallback_to_text_on_image_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    hints = [
+        "image",
+        "vision",
+        "multimodal",
+        "image_url",
+        "does not support",
+        "not support",
+        "unsupported",
+        "content part",
+        "invalid type",
+    ]
+    return any(hint in text for hint in hints)
 
 
 def call_ai(
@@ -758,7 +1287,8 @@ def call_ai(
     user_prompt: str,
     provider_specs: Dict[str, Dict[str, object]],
     enable_thinking: bool = False,
-) -> str:
+    image_paths: Optional[List[Path]] = None,
+) -> Tuple[str, Dict[str, Any]]:
     spec = provider_specs.get(provider, {})
     provider_type = str(spec.get("provider_type", "openai_compatible"))
 
@@ -770,26 +1300,54 @@ def call_ai(
             client = OpenAI(api_key=api_key, base_url=str(base_url))
         else:
             client = OpenAI(api_key=api_key)
-        req: Dict[str, object] = {
+        base_req: Dict[str, object] = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
             "temperature": 0.2,
         }
         if enable_thinking:
             if provider == "qwen":
                 # DashScope OpenAI 兼容：通过 extra_body.enable_thinking 开启思考
-                req["extra_body"] = {"enable_thinking": True}
+                base_req["extra_body"] = {"enable_thinking": True}
             elif provider == "deepseek":
                 # DeepSeek OpenAI SDK：通过 extra_body.thinking 开启思考
-                req["extra_body"] = {"thinking": {"type": "enabled"}}
+                base_req["extra_body"] = {"thinking": {"type": "enabled"}}
             elif provider == "openai":
                 # OpenAI Chat Completions：通过 reasoning_effort 提升推理深度
-                req["reasoning_effort"] = "high"
-        resp = client.chat.completions.create(**req)
-        return (resp.choices[0].message.content or "").strip()
+                base_req["reasoning_effort"] = "high"
+
+        text_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if image_paths:
+            multimodal_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": build_openai_user_content(user_prompt, image_paths)},
+            ]
+            try:
+                resp = client.chat.completions.create(**{**base_req, "messages": multimodal_messages})
+                return (resp.choices[0].message.content or "").strip(), {
+                    "used_images": True,
+                    "image_count": len(image_paths),
+                    "fell_back_to_text": False,
+                }
+            except Exception as exc:
+                if not should_fallback_to_text_on_image_error(exc):
+                    raise
+                resp = client.chat.completions.create(**{**base_req, "messages": text_messages})
+                return (resp.choices[0].message.content or "").strip(), {
+                    "used_images": False,
+                    "image_count": len(image_paths),
+                    "fell_back_to_text": True,
+                    "image_fallback_reason": str(exc),
+                }
+
+        resp = client.chat.completions.create(**{**base_req, "messages": text_messages})
+        return (resp.choices[0].message.content or "").strip(), {
+            "used_images": False,
+            "image_count": 0,
+            "fell_back_to_text": False,
+        }
 
     if provider_type == "gemini":
         import google.generativeai as genai
@@ -803,7 +1361,12 @@ def call_ai(
             ],
             generation_config={"temperature": 0.2},
         )
-        return (resp.text or "").strip()
+        return (resp.text or "").strip(), {
+            "used_images": False,
+            "image_count": 0,
+            "fell_back_to_text": bool(image_paths),
+            "image_fallback_reason": "Gemini 图像输入尚未接入当前主流程" if image_paths else "",
+        }
 
     raise ValueError(f"不支持的 provider: {provider}")
 
@@ -861,7 +1424,8 @@ def choose_existing_folder_with_ai(
         NEW: <目录名>
         """
     ).strip()
-    raw = call_ai(provider, model, api_key, system_prompt, user_prompt, provider_specs).strip()
+    raw, _ = call_ai(provider, model, api_key, system_prompt, user_prompt, provider_specs)
+    raw = raw.strip()
     m = re.match(r"^\s*EXISTING\s*[:：]\s*(.+?)\s*$", raw, flags=re.I)
     if not m:
         return None
@@ -878,7 +1442,7 @@ def check_model_connectivity(
     """
     Dry-run 模式下仅做一次最小化连通性校验，不触发论文分析。
     """
-    ping = call_ai(
+    ping, _ = call_ai(
         provider=provider,
         model=model,
         api_key=api_key,
@@ -889,6 +1453,36 @@ def check_model_connectivity(
     )
     if not ping.strip():
         raise RuntimeError("模型连通性测试失败：返回为空")
+
+
+def check_mineru_connectivity(token: str, model_version: str, language: str) -> None:
+    """
+    通过官方 file-urls/batch 接口做最小化联通性校验。
+    该检查仅申请上传链接，不上传文件，因此不会进入正式解析流程。
+    """
+    if not token:
+        raise RuntimeError(f"缺少 MinerU API Token，请在 {ENV_PATH} 中配置 MINERU_API_TOKEN")
+    probe_id = f"dry-run-probe-{int(time.time())}"
+    payload = {
+        "model_version": model_version,
+        "language": language,
+        "enable_formula": True,
+        "enable_table": True,
+        "files": [
+            {
+                "name": "connectivity-check.pdf",
+                "data_id": probe_id,
+            }
+        ],
+    }
+    obj = mineru_api_json("POST", "/file-urls/batch", token, payload=payload, timeout=60)
+    data = obj.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("MinerU 连通性测试失败：响应缺少 data")
+    batch_id = str(data.get("batch_id") or "").strip()
+    file_urls = data.get("file_urls")
+    if not batch_id or not isinstance(file_urls, list) or not file_urls or not str(file_urls[0] or "").strip():
+        raise RuntimeError("MinerU 连通性测试失败：未拿到有效上传链接")
 
 
 def safe_folder_name(name: str) -> str:
@@ -1022,10 +1616,26 @@ def display_rel_path(path: Path, root: Path) -> str:
         return str(path)
 
 
-def build_prompt(paper: Paper, template_md: str, pdf_text: str) -> Tuple[str, str]:
+def display_short_path(path: Path, root: Path, max_name_len: int = 36) -> str:
+    try:
+        rel = path.relative_to(root)
+    except Exception:
+        rel = path
+    parent = rel.parent
+    name = rel.name
+    if len(name) > max_name_len:
+        suffix = rel.suffix
+        stem = rel.stem
+        keep = max(8, max_name_len - len(suffix) - 3)
+        name = f"{stem[:keep]}...{suffix}"
+    return str(parent / name) if str(parent) != "." else name
+
+
+def build_prompt(paper: Paper, template_md: str, parsed_doc: ParsedDocument) -> Tuple[str, str]:
     system_prompt = (
         "你是资深科研导师和研究助理。你的输出必须严谨、结构化、中文表达清晰。"
         "对论文未明确给出的信息必须标注‘论文未明确说明’。"
+        "优先利用标题层级、表格、公式和列表结构理解论文内容，不要把版面噪声当成事实。"
     )
 
     translated_line = f"\n        - 标题翻译: {paper.translated_title}" if paper.translated_title else ""
@@ -1044,9 +1654,16 @@ def build_prompt(paper: Paper, template_md: str, pdf_text: str) -> Tuple[str, st
         """
     ).strip()
 
+    if parsed_doc.content_format == "markdown":
+        source_heading = "【论文结构化解析结果（Markdown）】"
+        source_body = f"````markdown\n{parsed_doc.content}\n````"
+    else:
+        source_heading = "【论文正文摘录（PDF文本）】"
+        source_body = parsed_doc.content
+
     user_prompt = textwrap.dedent(
         f"""
-        你需要阅读下面给出的论文正文摘录，并严格按模板输出论文深度分析。
+        你需要阅读下面给出的论文内容，并严格按模板输出论文深度分析。
 
         输出必须满足 Obsidian 可渲染的 Markdown 规范：
         1) 所有表格前后必须空一行
@@ -1055,6 +1672,7 @@ def build_prompt(paper: Paper, template_md: str, pdf_text: str) -> Tuple[str, st
         4) 表格列使用标准 GitHub Markdown 语法（如 | 列1 | 列2 |）
         5) 禁止输出非标准表格写法
         6) 数学公式请使用 LaTeX：行内公式使用一对 $ 包裹，独立公式块使用一对 $$ 包裹
+        7) 若附带论文配图输入，请结合图像内容理解图表、显微图和流程图
 
         先输出一行：
         建议目录：<一个短目录名，体现论文研究方向，例如“磁纳米测温”/“AI医疗”>
@@ -1066,8 +1684,8 @@ def build_prompt(paper: Paper, template_md: str, pdf_text: str) -> Tuple[str, st
 
         {metadata_block}
 
-        【论文正文摘录（PDF文本）】
-        {pdf_text}
+        {source_heading}
+        {source_body}
         """
     ).strip()
     return system_prompt, user_prompt
@@ -1085,6 +1703,33 @@ def load_state(path: Path) -> Dict[str, str]:
 def save_state(path: Path, state: Dict[str, str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def zotero_utc_to_beijing(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return text
+    try:
+        dt = datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return text
+
+
+def format_publication_month(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    m = re.match(r"^(\d{4})-(\d{2})", text)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    m = re.match(r"^(\d{4})[/-](\d{1,2})", text)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}"
+    m = re.match(r"^(\d{4})$", text)
+    if m:
+        return m.group(1)
+    return text
 
 
 def compose_note_markdown(
@@ -1134,9 +1779,8 @@ def compose_note_markdown(
         "doi": paper.doi,
         "作者": paper.creators,
         "期刊/会议": paper.publication_title,
-        "发表日期": paper.date,
+        "发表日期": format_publication_month(paper.date),
         "文件夹": folder_rel,
-        "文件路径": str(pdf_path),
         "AI模型": model,
         "AI精读日期": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "tags": unique_tags,
@@ -1182,6 +1826,43 @@ def validate_scan_scope(args: argparse.Namespace) -> None:
     )
 
 
+def remove_path_safely(path: Path) -> None:
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def format_pdf_parse_result(parsed_doc: ParsedDocument) -> str:
+    parser_name = parsed_doc.parser_name
+    fallback_reason = str(parsed_doc.meta.get("fallback_reason") or "").strip()
+    if parser_name == "pypdf" and fallback_reason:
+        return "成功（已自动回退到 pypdf）"
+    return "成功"
+
+
+def format_multimodal_result(
+    parsed_doc: ParsedDocument,
+    provider_type: str,
+    image_paths: List[Path],
+    ai_meta: Dict[str, Any],
+) -> str:
+    if ai_meta.get("used_images"):
+        return f"成功（已发送 {ai_meta.get('image_count', 0)} 张关键配图）"
+    if ai_meta.get("fell_back_to_text") and ai_meta.get("image_count"):
+        return "未启用（已自动回退到纯文本模式）"
+    if provider_type != "openai_compatible":
+        return "未启用（当前 provider 暂不接入图像输入）"
+    if parsed_doc.parser_name != "mineru":
+        return "未启用（当前解析结果无可用图片）"
+    if not image_paths:
+        return "未启用（未找到合适配图）"
+    return "未启用"
+
+
 def run() -> int:
     args = parse_args()
     validate_scan_scope(args)
@@ -1198,10 +1879,17 @@ def run() -> int:
 
     template_md = load_template(args.template)
     state_file = Path(args.state_file)
+    legacy_parser_cache_root = state_file.parent / "parser_cache"
+    if legacy_parser_cache_root.exists():
+        remove_path_safely(legacy_parser_cache_root)
     state = load_state(state_file)
-    easy_secret_key = (load_dotenv_values().get("SecretKey") or "").strip()
+    dotenv_values = load_dotenv_values()
+    easy_secret_key = (dotenv_values.get("SecretKey") or "").strip()
+    mineru_token = (dotenv_values.get("MINERU_API_TOKEN") or "").strip()
     if easy_secret_key:
         print("[INFO] 检测到 SecretKey，已启用期刊等级自动检索（sciif/sci/sciUp）")
+    if args.pdf_parser == "mineru" and not mineru_token:
+        raise RuntimeError(f"缺少 MinerU API Token，请在 {ENV_PATH} 中配置 MINERU_API_TOKEN")
 
     papers: List[Paper] = []
     # “处理数量上限”按实际处理数计算，而不是候选检索数。
@@ -1244,105 +1932,149 @@ def run() -> int:
         print("[DRY-RUN] 模式开启：仅预演流程，不执行论文分析、不写入 Obsidian。")
         check_model_connectivity(args.provider, model, api_key, provider_specs)
         print(f"[DRY-RUN] 模型连通性测试通过: provider={args.provider}, model={model}")
+        if args.pdf_parser != "pypdf":
+            check_mineru_connectivity(
+                token=mineru_token,
+                model_version=args.mineru_model_version,
+                language=args.mineru_language,
+            )
+            print(
+                "[DRY-RUN] MinerU 连通性测试通过: "
+                f"parser={args.pdf_parser}, model_version={args.mineru_model_version}, language={args.mineru_language}"
+            )
 
     processed_count = 0
-    for p in papers:
-        if processed_count >= args.limit:
-            break
-        marker = f"{p.parent_key}:{p.date_modified}"
-        # 去重按 parent_key 为主，避免“仅做 PDF 批注/附件时间变化”触发重复精读。
-        # 旧版本 state value 可能是 key:dateModified，这里仅检查 key 是否存在以保持兼容。
-        if not args.force and p.parent_key in state:
-            print(f"[SKIP] 条目 {p.parent_key} 已经被处理过（如需重跑，请在左侧勾选 Force）")
-            continue
-
-        pdf_path = resolve_pdf_path(args.zotero_storage, p)
-        if not pdf_path or not pdf_path.exists():
-            print(f"[WARN] 找不到 PDF，跳过: {p.parent_key} {pdf_path}")
-            continue
-
-        print(f"[INFO] 处理论文: {p.title or p.parent_key}")
-        folder_suggestion = ""
-        note_md = ""
-        if not args.dry_run:
-            pdf_text = extract_pdf_text(pdf_path, args.max_pdf_chars)
-            if not pdf_text.strip():
-                print(f"[WARN] PDF 无可提取文本，跳过: {pdf_path}")
+    with tempfile.TemporaryDirectory(prefix="mineru_parser_cache_") as parser_cache_tmp:
+        parser_cache_root = Path(parser_cache_tmp)
+        for p in papers:
+            if processed_count >= args.limit:
+                break
+            marker = f"{p.parent_key}:{zotero_utc_to_beijing(p.date_modified)}"
+            # 去重按 parent_key 为主，避免“仅做 PDF 批注/附件时间变化”触发重复精读。
+            # 旧版本 state value 可能是 key:dateModified，这里仅检查 key 是否存在以保持兼容。
+            if not args.force and p.parent_key in state:
+                print(f"[SKIP] 条目 {p.parent_key} 已经被处理过（如需重新生成，请在左侧勾选 Force）")
                 continue
 
-            system_prompt, user_prompt = build_prompt(p, template_md, pdf_text)
-            ai_raw = call_ai(
-                args.provider,
-                model,
-                api_key,
-                system_prompt,
-                user_prompt,
-                provider_specs,
-                enable_thinking=args.enable_thinking,
-            )
-            folder_suggestion, note_md = parse_ai_output(ai_raw)
-            note_md = normalize_markdown_for_obsidian(note_md)
+            pdf_path = resolve_pdf_path(args.zotero_storage, p)
+            if not pdf_path or not pdf_path.exists():
+                print(f"[WARN] 找不到 PDF，跳过: {p.parent_key} {pdf_path}")
+                continue
 
-        existing_dir_map = map_existing_dirs_by_name(obsidian_root)
-        collection_hit = next((existing_dir_map[c] for c in p.collections if c in existing_dir_map), None)
-        target_folder = choose_folder(obsidian_root, p, folder_suggestion, note_md, dir_names=existing_dir_map)
-        if not args.dry_run and folder_suggestion.strip() and collection_hit is None:
-            picked_existing_name = choose_existing_folder_with_ai(
-                provider=args.provider,
-                model=model,
-                api_key=api_key,
-                provider_specs=provider_specs,
-                suggested_folder=folder_suggestion,
-                paper=p,
-                existing_dir_names=list(existing_dir_map.keys()),
-            )
-            if picked_existing_name:
-                target_folder = existing_dir_map[picked_existing_name]
-                print(f"[INFO] 目录二次决策：命中已有目录 -> {display_rel_path(target_folder, obsidian_root)}")
-        folder_rel = str(target_folder.relative_to(obsidian_root))
-        filename_base = safe_filename(p.title or p.parent_key)
-        out_file = target_folder / f"{datetime.now().strftime('%Y%m%d_%H%M')}_{filename_base}.md"
-        out_file_display = display_rel_path(out_file, obsidian_root)
+            print(f"[INFO] 处理论文: {p.title or p.parent_key}")
+            folder_suggestion = ""
+            note_md = ""
+            cache_dir_to_cleanup: Optional[Path] = None
+            if not args.dry_run:
+                parsed_doc = extract_document_content(
+                    pdf_path=pdf_path,
+                    paper=p,
+                    pdf_parser=args.pdf_parser,
+                    max_chars=args.max_pdf_chars,
+                    cache_root=parser_cache_root,
+                    mineru_token=mineru_token,
+                    mineru_model_version=args.mineru_model_version,
+                    mineru_language=args.mineru_language,
+                )
+                if parsed_doc.parser_name == "mineru":
+                    cache_dir_to_cleanup = parser_cache_dir(
+                        parser_cache_root,
+                        p,
+                        "mineru",
+                        args.mineru_model_version,
+                    )
+                print(f"[INFO] PDF 解析方法: {parsed_doc.parser_name}")
+                print(f"[INFO] PDF 解析结果: {format_pdf_parse_result(parsed_doc)}")
+                if not parsed_doc.content.strip():
+                    print(f"[WARN] PDF 无可提取文本，跳过: {pdf_path}")
+                    continue
 
-        if args.dry_run:
-            print("[DRY-RUN] ===== 预演日志（不会实际执行分析/不会写文件） =====")
-            print(f"[DRY-RUN] 将处理论文: {p.parent_key}")
-            print(f"[DRY-RUN] PDF 路径: {pdf_path}")
-            print(f"[DRY-RUN] 将写入: {out_file_display}")
-            print(f"[DRY-RUN] 目录决策: collection/规则推断 -> {display_rel_path(target_folder, obsidian_root)}")
-        else:
-            rank_info: Dict[str, str] = {}
-            if easy_secret_key and p.publication_title.strip():
-                try:
-                    rank_info = fetch_easyscholar_rank_info(easy_secret_key, p.publication_title)
-                    if rank_info:
-                        parts = []
-                        if rank_info.get("sciif"):
-                            parts.append(f"IF {rank_info['sciif']}")
-                        if rank_info.get("sci"):
-                            parts.append(f"SCI {rank_info['sci']}")
-                        if rank_info.get("sciUp"):
-                            parts.append(f"中科院 {rank_info['sciUp']}")
-                        if parts:
-                            print(f"[INFO] 期刊等级: {'  '.join(parts)}")
-                except Exception as e:
-                    print(f"[WARN] 期刊等级检索失败（已跳过，不影响主流程）: {e}")
+                system_prompt, user_prompt = build_prompt(p, template_md, parsed_doc)
+                spec = provider_specs.get(args.provider, {})
+                provider_type = str(spec.get("provider_type", "openai_compatible"))
+                image_paths: List[Path] = []
+                if provider_type == "openai_compatible":
+                    image_paths = select_multimodal_images(parsed_doc, max_images=MAX_MULTIMODAL_IMAGES)
 
-            note_final = compose_note_markdown(
-                p,
-                note_md,
-                pdf_path,
-                folder_rel,
-                model=model,
-                rank_info=rank_info,
-            )
-            target_folder.mkdir(parents=True, exist_ok=True)
-            out_file.write_text(note_final, encoding="utf-8")
-            print(f"[OK] 已写入: {out_file_display}")
-            state[p.parent_key] = marker
-            save_state(state_file, state)
+                ai_raw, ai_meta = call_ai(
+                    args.provider,
+                    model,
+                    api_key,
+                    system_prompt,
+                    user_prompt,
+                    provider_specs,
+                    enable_thinking=args.enable_thinking,
+                    image_paths=image_paths,
+                )
+                print(
+                    "[INFO] 多模态图像输入: "
+                    f"{format_multimodal_result(parsed_doc, provider_type, image_paths, ai_meta)}"
+                )
+                folder_suggestion, note_md = parse_ai_output(ai_raw)
+                note_md = normalize_markdown_for_obsidian(note_md)
 
-        processed_count += 1
+            existing_dir_map = map_existing_dirs_by_name(obsidian_root)
+            collection_hit = next((existing_dir_map[c] for c in p.collections if c in existing_dir_map), None)
+            target_folder = choose_folder(obsidian_root, p, folder_suggestion, note_md, dir_names=existing_dir_map)
+            if not args.dry_run and folder_suggestion.strip() and collection_hit is None:
+                picked_existing_name = choose_existing_folder_with_ai(
+                    provider=args.provider,
+                    model=model,
+                    api_key=api_key,
+                    provider_specs=provider_specs,
+                    suggested_folder=folder_suggestion,
+                    paper=p,
+                    existing_dir_names=list(existing_dir_map.keys()),
+                )
+                if picked_existing_name:
+                    target_folder = existing_dir_map[picked_existing_name]
+                    print(f"[INFO] 目录二次决策：命中已有目录 -> {display_rel_path(target_folder, obsidian_root)}")
+            folder_rel = str(target_folder.relative_to(obsidian_root))
+            filename_base = safe_filename(p.title or p.parent_key)
+            out_file = target_folder / f"{datetime.now().strftime('%Y%m%d_%H%M')}_{filename_base}.md"
+            out_file_display = display_short_path(out_file, obsidian_root)
+
+            if args.dry_run:
+                print("[DRY-RUN] ===== 预演日志（不会实际执行分析/不会写文件） =====")
+                print(f"[DRY-RUN] 将处理论文: {p.parent_key}")
+                print(f"[DRY-RUN] PDF 路径: {pdf_path}")
+                print(f"[DRY-RUN] 将写入: {out_file_display}")
+                print(f"[DRY-RUN] 目录决策: collection/规则推断 -> {display_rel_path(target_folder, obsidian_root)}")
+            else:
+                rank_info: Dict[str, str] = {}
+                if easy_secret_key and p.publication_title.strip():
+                    try:
+                        rank_info = fetch_easyscholar_rank_info(easy_secret_key, p.publication_title)
+                        if rank_info:
+                            parts = []
+                            if rank_info.get("sciif"):
+                                parts.append(f"IF {rank_info['sciif']}")
+                            if rank_info.get("sci"):
+                                parts.append(f"SCI {rank_info['sci']}")
+                            if rank_info.get("sciUp"):
+                                parts.append(f"中科院 {rank_info['sciUp']}")
+                            if parts:
+                                print(f"[INFO] 期刊等级: {'  '.join(parts)}")
+                    except Exception as e:
+                        print(f"[WARN] 期刊等级检索失败（已跳过，不影响主流程）: {e}")
+
+                note_final = compose_note_markdown(
+                    p,
+                    note_md,
+                    pdf_path,
+                    folder_rel,
+                    model=model,
+                    rank_info=rank_info,
+                )
+                target_folder.mkdir(parents=True, exist_ok=True)
+                out_file.write_text(note_final, encoding="utf-8")
+                print(f"[OK] 已写入: {out_file_display}")
+                state[p.parent_key] = marker
+                save_state(state_file, state)
+                if cache_dir_to_cleanup is not None:
+                    remove_path_safely(cache_dir_to_cleanup)
+
+            processed_count += 1
 
     print(f"完成，处理 {processed_count} 篇论文。")
     return 0
