@@ -24,6 +24,10 @@ env/
 .streamlit/secrets.toml
 .streamlit/cache/
 
+# Frontend local dependencies/build output
+frontend/node_modules/
+frontend/dist/
+
 # Editors
 .vscode/
 .idea/

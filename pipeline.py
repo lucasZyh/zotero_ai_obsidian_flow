@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--provider-config",
         default=default_provider_config_path(),
-        help="供应商配置文件（provider_specs 与默认模型等，不保存 API Key）",
+        help="供应商配置文件（providers 中保存模型和默认设置，不保存 API Key）",
     )
     parser.add_argument("--limit", type=int, default=1, help="每次处理论文数量")
     parser.add_argument("--since-days", type=int, default=0, help="只处理最近 N 天更新的条目，0 表示不过滤")
@@ -152,28 +152,34 @@ def parse_args() -> argparse.Namespace:
 
 def resolve_provider_specs(provider_config_path: str) -> Dict[str, Dict[str, object]]:
     cfg = load_provider_config(provider_config_path)
-    catalog = (cfg.get("provider_specs") or {}) if isinstance(cfg, dict) else {}
+    legacy_catalog = (cfg.get("provider_specs") or {}) if isinstance(cfg, dict) else {}
+    catalog = legacy_catalog if legacy_catalog else ((cfg.get("providers") or {}) if isinstance(cfg, dict) else {})
     if not isinstance(catalog, dict) or not catalog:
-        raise RuntimeError(
-            f"供应商目录缺失：请在 {Path(provider_config_path).expanduser()} 中配置 provider_specs"
-        )
+        catalog = legacy_catalog
+    if not isinstance(catalog, dict) or not catalog:
+        raise RuntimeError(f"供应商目录缺失：请在 {Path(provider_config_path).expanduser()} 中配置 providers")
 
     merged: Dict[str, Dict[str, object]] = {}
     for name, item in catalog.items():
         if not isinstance(item, dict):
             continue
         models = item.get("models", [])
+        custom_models = item.get("custom_models", [])
         if not isinstance(models, list):
             models = []
+        if isinstance(custom_models, list):
+            for m in custom_models:
+                if isinstance(m, str) and m.strip() and m not in models:
+                    models.append(m)
         merged[str(name)] = {
             "provider_type": item.get("provider_type") or "openai_compatible",
             "env_var": item.get("env_var") or "",
-            "default_model": item.get("default_model") or (models[0] if models else ""),
+            "default_model": item.get("default_model") or item.get("model") or (models[0] if models else ""),
             "models": [m for m in models if isinstance(m, str) and m.strip()],
             "base_url": item.get("base_url"),
         }
-    providers_cfg = (cfg.get("providers") or {}) if isinstance(cfg, dict) else {}
-    for name, item in providers_cfg.items():
+    legacy_overrides = (cfg.get("providers") or {}) if legacy_catalog and isinstance(cfg, dict) else {}
+    for name, item in legacy_overrides.items():
         if not isinstance(item, dict):
             continue
         existing = dict(merged.get(name, {}))

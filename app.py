@@ -153,11 +153,11 @@ def load_provider_settings(path: str) -> dict:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         data = {"providers": {}}
-    if "provider_specs" not in data or not isinstance(data["provider_specs"], dict):
-        data["provider_specs"] = {}
+    if not isinstance(data, dict):
+        data = {"providers": {}}
+    data = normalize_provider_settings(data)
     if "providers" not in data or not isinstance(data["providers"], dict):
         data["providers"] = {}
-    # 清洗异常 key（空字符串/空白）
     cleaned = {}
     for k, v in data["providers"].items():
         if not isinstance(k, str):
@@ -170,9 +170,56 @@ def load_provider_settings(path: str) -> dict:
     return data
 
 
+def normalize_provider_settings(data: dict) -> dict:
+    providers_raw = data.get("providers") if isinstance(data.get("providers"), dict) else {}
+    specs_raw = data.get("provider_specs") if isinstance(data.get("provider_specs"), dict) else {}
+    unified: dict[str, dict] = {}
+
+    for name, item in specs_raw.items():
+        if not isinstance(item, dict):
+            continue
+        models = item.get("models", [])
+        if not isinstance(models, list):
+            models = []
+        clean_models = [str(m).strip() for m in models if str(m).strip()]
+        unified[str(name)] = {
+            "provider_type": item.get("provider_type") or "openai_compatible",
+            "env_var": item.get("env_var") or provider_env_key(str(name), {}),
+            "default_model": item.get("default_model") or (clean_models[0] if clean_models else ""),
+            "models": clean_models,
+            "base_url": item.get("base_url"),
+        }
+
+    for name, item in providers_raw.items():
+        if not isinstance(item, dict):
+            continue
+        existing = dict(unified.get(str(name), {}))
+        item_models = item.get("models", [])
+        if not isinstance(item_models, list):
+            item_models = []
+        custom_models = item.get("custom_models", [])
+        if not isinstance(custom_models, list):
+            custom_models = []
+        models = list(existing.get("models", []))
+        for value in [*item_models, *custom_models, item.get("model") or item.get("default_model")]:
+            text = str(value or "").strip()
+            if text and text not in models:
+                models.append(text)
+        unified[str(name)] = {
+            "provider_type": item.get("provider_type") or existing.get("provider_type") or "openai_compatible",
+            "env_var": item.get("env_var") or existing.get("env_var") or provider_env_key(str(name), {}),
+            "default_model": item.get("default_model") or item.get("model") or existing.get("default_model") or (models[0] if models else ""),
+            "models": models,
+            "base_url": item.get("base_url", existing.get("base_url")),
+        }
+
+    return {"providers": unified}
+
+
 def save_provider_settings(path: str, settings: dict) -> None:
     p = Path(path).expanduser()
     p.parent.mkdir(parents=True, exist_ok=True)
+    settings = normalize_provider_settings(settings)
     p.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
     try:
         os.chmod(p, 0o600)
@@ -269,28 +316,24 @@ def clean_and_persist_provider_settings(path: str) -> dict:
     settings = load_provider_settings(path)
     # 迁移旧版 providers.json 中明文 api_key 到 .env，再从配置中移除
     providers = settings.setdefault("providers", {})
-    specs = settings.setdefault("provider_specs", {})
     migrated = False
     for pname, pitem in list(providers.items()):
         if not isinstance(pitem, dict):
             continue
         old_key = str(pitem.get("api_key", "") or "").strip()
         if old_key:
-            set_provider_api_key(pname, specs.get(pname, {}), old_key)
+            set_provider_api_key(pname, pitem, old_key)
             pitem.pop("api_key", None)
             migrated = True
-    if migrated:
+    if migrated or "provider_specs" in settings:
+        save_provider_settings(path, settings)
         st.info(f"检测到旧版 API Key，已自动迁移到 {ENV_PATH}")
-    save_provider_settings(path, settings)
     return settings
-
 
 def get_provider_names(settings: dict) -> list[str]:
     saved = [sanitize_provider_name(k) for k in list((settings.get("providers") or {}).keys()) if isinstance(k, str)]
     saved = [k for k in saved if k]
-    builtins = [sanitize_provider_name(k) for k in list((settings.get("provider_specs") or {}).keys()) if isinstance(k, str)]
-    builtins = [k for k in builtins if k]
-    return sorted(set(builtins + saved))
+    return sorted(set(saved))
 
 
 def normalize_provider_names(names: list[str]) -> list[str]:
@@ -324,24 +367,19 @@ def sanitize_provider_name(name: str) -> str:
 
 
 def provider_spec_for_ui(provider: str, settings: dict) -> dict:
-    builtin = dict(((settings.get("provider_specs") or {}).get(provider) or {}))
     saved = ((settings.get("providers") or {}).get(provider) or {})
-    models = list(builtin.get("models", []))
-    custom_models = saved.get("custom_models", [])
-    if isinstance(custom_models, list):
-        for m in custom_models:
-            if isinstance(m, str) and m.strip() and m not in models:
-                models.append(m)
-    default_model = saved.get("model") or builtin.get("default_model") or ""
+    models = [str(m).strip() for m in list(saved.get("models", [])) if str(m).strip()]
+    default_model = saved.get("default_model") or saved.get("model") or ""
     if default_model and default_model not in models:
         models.append(default_model)
+    env_var = provider_env_key(provider, saved)
     return {
-        "provider_type": saved.get("provider_type") or builtin.get("provider_type") or "openai_compatible",
-        "base_url": saved.get("base_url", builtin.get("base_url", "")) or "",
+        "provider_type": saved.get("provider_type") or "openai_compatible",
+        "base_url": saved.get("base_url") or "",
         "default_model": default_model,
         "models": models,
-        "env_var": provider_env_key(provider, builtin),
-        "api_key": get_provider_api_key(provider, builtin),
+        "env_var": env_var,
+        "api_key": load_env_map().get(env_var, ""),
     }
 
 
@@ -349,19 +387,15 @@ def provider_spec_for_ui(provider: str, settings: dict) -> dict:
 def provider_settings_dialog(provider_config: str):
     settings = load_provider_settings(provider_config)
     providers = settings.setdefault("providers", {})
-    catalog = settings.setdefault("provider_specs", {})
     page = st.radio("页面", ["内置供应商", "新增供应商", "MinerU 配置"], horizontal=True, index=0, label_visibility="collapsed")
 
     if page == "内置供应商":
         names = normalize_provider_names(get_provider_names(settings))
         if not names:
-            names = list((settings.get("provider_specs") or {}).keys())
+            st.warning("未找到供应商，请先新增供应商。")
+            st.stop()
         chosen = st.selectbox("选择供应商", names, index=0)
         spec = provider_spec_for_ui(chosen, settings)
-        saved_raw = providers.get(chosen, {})
-        saved_extra_models = saved_raw.get("custom_models", []) if isinstance(saved_raw, dict) else []
-        if not isinstance(saved_extra_models, list):
-            saved_extra_models = []
 
         env_var = str(spec.get("env_var", "") or "")
         api_key = st.text_input("API Key", value=spec.get("api_key", ""), type="password")
@@ -370,16 +404,19 @@ def provider_settings_dialog(provider_config: str):
         model = st.text_input("默认模型", value=spec["default_model"])
         provider_type = st.selectbox("供应商类型", ["openai_compatible", "gemini"], index=0 if spec["provider_type"] == "openai_compatible" else 1)
         base_url = st.text_input("Base URL（openai_compatible 时使用）", value=str(spec["base_url"]))
-        custom_models = st.text_input("额外模型（逗号分隔）", value=",".join([m for m in saved_extra_models if isinstance(m, str) and m.strip()]))
+        custom_models = st.text_input("额外模型（逗号分隔）", value=", ".join([m for m in spec["models"] if isinstance(m, str) and m.strip()]))
 
         if st.button("保存当前供应商配置", key="save_existing_provider"):
             items = [x.strip() for x in custom_models.split(",") if x.strip()]
-            set_provider_api_key(chosen, ((settings.get("provider_specs") or {}).get(chosen) or {}), api_key)
+            if model.strip() and model.strip() not in items:
+                items.append(model.strip())
+            set_provider_api_key(chosen, {"env_var": env_var}, api_key)
             providers[chosen] = {
-                "model": model.strip(),
                 "provider_type": provider_type,
+                "env_var": env_var or provider_env_key(chosen, {}),
+                "default_model": model.strip(),
+                "models": items,
                 "base_url": base_url.strip(),
-                "custom_models": items,
             }
             save_provider_settings(provider_config, settings)
             st.success("已保存")
@@ -396,20 +433,14 @@ def provider_settings_dialog(provider_config: str):
             if not name:
                 st.error("请先填写供应商名称")
             else:
-                catalog[name] = {
+                providers[name] = {
                     "provider_type": new_type,
                     "env_var": new_env_var.strip() or provider_env_key(name, {}),
                     "default_model": new_model.strip(),
                     "models": [new_model.strip()] if new_model.strip() else [],
                     "base_url": new_base_url.strip(),
                 }
-                providers[name] = {
-                    "model": new_model.strip(),
-                    "provider_type": new_type,
-                    "base_url": new_base_url.strip(),
-                    "custom_models": [new_model.strip()] if new_model.strip() else [],
-                }
-                set_provider_api_key(name, catalog[name], new_api_key)
+                set_provider_api_key(name, providers[name], new_api_key)
                 save_provider_settings(provider_config, settings)
                 st.success(f"已添加供应商：{name}")
                 st.rerun()
@@ -931,16 +962,17 @@ def main():
             st.stop()
         providers = settings.setdefault("providers", {})
         old = providers.get(provider, {})
-        custom_models = old.get("custom_models", [])
-        if not isinstance(custom_models, list):
-            custom_models = []
-        if model not in spec["models"] and model not in custom_models:
-            custom_models.append(model)
+        if not isinstance(old, dict):
+            old = {}
+        models = list(spec["models"])
+        if model and model not in models:
+            models.append(model)
         providers[provider] = {
-            "model": model,
+            "default_model": model,
             "provider_type": old.get("provider_type", spec.get("provider_type", "openai_compatible")),
+            "env_var": old.get("env_var") or spec.get("env_var") or provider_env_key(provider, {}),
+            "models": models,
             "base_url": old.get("base_url", spec.get("base_url", "")),
-            "custom_models": custom_models,
         }
         save_provider_settings(provider_config, settings)
 
